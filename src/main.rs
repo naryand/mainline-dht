@@ -1,80 +1,49 @@
-use std::{
-    collections::{BTreeMap, HashMap},
-    net::IpAddr,
-};
+mod dht;
+mod krpc;
 
-const ID_BYTES: usize = 20;
-#[derive(Hash, Clone, PartialEq, Eq, PartialOrd, Ord)]
-struct NodeId([u8; ID_BYTES]);
+use krpc::KRPC;
+use dht::{IpPort, MainlineDHT, NodeId, ID_BYTES};
 
-type InfoHash = NodeId;
+use std::{io, net::IpAddr, sync::Arc};
 
-#[derive(Clone)]
-struct IpPort {
-    ip: IpAddr,
-    port: u16,
-}
+use tokio::sync::Mutex;
 
-#[derive(Clone)]
-struct Node {
-    id: NodeId,
-    ip_port: IpPort,
-}
 
-struct MainlineDHT {
-    table: BTreeMap<NodeId, Node>,
-    hashmap: HashMap<InfoHash, Vec<IpPort>>,
-    k: usize,
-}
+#[tokio::main]
+async fn main() -> io::Result<()> {
+    let krpc = KRPC::new().await;
+    let dht = Arc::new(Mutex::new(MainlineDHT::new()));
 
-impl MainlineDHT {
-    fn insert_node(&mut self, node: Node) {
-        let id = node.id.clone();
-        self.table.insert(id, node);
-    }
+    let ip_port = (IpAddr::from([67, 215, 246, 10]), 6881);
 
-    fn find_closest(&self, id: &NodeId) -> Vec<Node> {
-        let all_ids: Vec<NodeId> = self.table.keys().map(|x| x.clone()).collect();
+    let krpc_ = Arc::clone(&krpc);
+    krpc_.ping(ip_port).await?;
 
-        let idx = all_ids.binary_search(id).unwrap();
-        let start = (idx - (self.k / 2)).clamp(0, all_ids.len());
-        let end = (idx + (self.k / 2)).clamp(0, all_ids.len());
+    let dht_ = Arc::clone(&dht);
+    let krpc_ = Arc::clone(&krpc);
+    krpc_.start_listener(dht_);
 
-        let k_closest_ids = all_ids[start..end].to_vec();
-        let mut k_closest = vec![];
-        for i in k_closest_ids {
-            k_closest.push(self.table.get(&i).unwrap().clone());
+    loop {
+        let node_id = NodeId(rand::random::<[u8; ID_BYTES]>());
+        let addrs;
+        {
+            let dht = dht.lock().await;
+            addrs = dht
+                .find_closest(&node_id)
+                .iter()
+                .map(|x| x.ip_port)
+                .collect::<Vec<IpPort>>();
         }
-
-        k_closest
-    }
-
-    fn find_node(&self, id: &NodeId) -> Result<Node, Vec<Node>> {
-        match self.table.get(id) {
-            Some(node) => Ok(node.clone()),
-            None => Err(self.find_closest(id)),
+        for addr in addrs {
+            let id = node_id.clone();
+            let krpc_ = Arc::clone(&krpc);
+            let _ = krpc_.find_node(addr, &id).await;
+        }
+        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+        {
+            let dht = dht.lock().await;
+            // println!("{:#?}", dht.find_closest(&node_id));
+            println!("{:?}", dht.table.len());
         }
     }
-
-    fn find_value(&self, id: &InfoHash) -> Result<Vec<IpPort>, Vec<Node>> {
-        match self.hashmap.get(id) {
-            Some(val) => Ok(val.clone()),
-            None => Err(self.find_closest(id)),
-        }
-    }
-
-    fn store(&mut self, id: &InfoHash, ip_port: IpPort) {
-        let _ = match self.hashmap.get(id) {
-            Some(val) => {
-                let mut new_val = val.clone();
-                new_val.push(ip_port);
-                self.hashmap.insert(id.clone(), new_val)
-            }
-            None => self.hashmap.insert(id.clone(), vec![ip_port]),
-        };
-    }
-}
-
-fn main() {
-    println!("Hello, world!");
 }
