@@ -1,13 +1,14 @@
 mod dht;
 mod krpc;
+mod model;
 
-use krpc::KRPC;
+// use krpc::KRPC;
 use dht::{IpPort, MainlineDHT, NodeId, ID_BYTES};
+use krpc::KRPC;
 
 use std::{io, net::IpAddr, sync::Arc};
 
 use tokio::sync::Mutex;
-
 
 #[tokio::main]
 async fn main() -> io::Result<()> {

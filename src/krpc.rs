@@ -1,20 +1,16 @@
-use crate::dht::{IpPort, MainlineDHT, Node, NodeId, ID_BYTES};
-
-use std::{
-    collections::{BTreeMap, HashMap},
-    convert::TryInto,
-    io,
-    net::SocketAddr,
-    sync::Arc,
+use crate::{
+    dht::{IpPort, MainlineDHT, Node, NodeId, ID_BYTES},
+    model::{Arguments, Message, Returns, Type},
 };
 
-use bencode::{decode::parse, encode::encode, Item};
+use std::{collections::HashMap, convert::TryInto, io, net::SocketAddr, sync::Arc};
+
+use bencode::{decode::from_bytes, encode};
 use crc32c::crc32c;
 use tokio::{
     net::UdpSocket,
     sync::{Mutex, OnceCell},
 };
-
 
 const RECV_BUF: usize = 2000;
 pub const PORT: u16 = 25565;
@@ -25,16 +21,7 @@ pub struct KRPC {
     tx: Transactions,
 }
 
-#[allow(unused)]
-#[derive(Debug)]
-enum Msg {
-    Ping,
-    FindNode,
-    GetPeers,
-    AnnouncePeer,
-}
-
-type Transactions = Mutex<HashMap<[u8; 2], (SocketAddr, Msg)>>;
+type Transactions = Mutex<HashMap<[u8; 2], SocketAddr>>;
 
 impl KRPC {
     pub async fn new() -> Arc<Self> {
@@ -59,6 +46,14 @@ impl KRPC {
         });
     }
 
+    fn get_node_id(id: &[u8]) -> Result<[u8; ID_BYTES], String> {
+        let mut node_id: [u8; ID_BYTES] = id
+            .try_into()
+            .map_err(|e| format!("node_id try_into fail {}", e))?;
+        node_id.reverse();
+        Ok(node_id)
+    }
+
     pub async fn listen(self: Arc<Self>, dht: Arc<Mutex<MainlineDHT>>) -> Result<(), String> {
         let mut buf = vec![0u8; RECV_BUF];
         let (len, addr) = self
@@ -68,23 +63,26 @@ impl KRPC {
             .map_err(|e| e.to_string())?;
         buf.truncate(len);
 
-        let response = parse(&mut buf).ok_or("parse error")?[0].get_dict();
-        match response
-            .get("y".as_bytes())
-            .ok_or("no y key")?
-            .get_str()
-            .as_slice()
-        {
-            // handle inbound queries
-            b"q" => match response.get("q".as_bytes()).unwrap().get_str().as_slice() {
-                // handle incomng ping
-                b"ping" => {
-                    let args = response.get("a".as_bytes()).unwrap().get_dict();
-                    let mut id = args.get("id".as_bytes()).unwrap().get_str();
-                    id.reverse();
+        let msg = from_bytes::<Message>(&buf).map_err(|e| e.to_string())?;
+        let _txid: [u8; 2] = msg
+            .t
+            .try_into()
+            .map_err(|e| format!("txid try_into fail {}", e))?;
 
+        match msg.mtype {
+            Type::Query { a, .. } => match a {
+                Arguments::AnnouncePeer {
+                    id,
+                    implied_port,
+                    info_hash,
+                    port,
+                    token,
+                } => {}
+                Arguments::GetPeers { id, info_hash } => {}
+                Arguments::FindNode { id, target } => {}
+                Arguments::Ping { id } => {
                     let node = Node {
-                        id: NodeId(id.try_into().unwrap()),
+                        id: NodeId(Self::get_node_id(id)?),
                         ip_port: (addr.ip(), addr.port()),
                     };
 
@@ -93,56 +91,51 @@ impl KRPC {
                         dht.insert_node(node);
                     }
                 }
-                _ => {}
             },
-            // handle response from sent query
-            b"r" => {
-                let r = response.get("r".as_bytes()).unwrap().get_dict();
-                let txid: [u8; 2] = response
-                    .get("t".as_bytes())
-                    .unwrap()
-                    .get_str()
-                    .as_slice()
-                    .try_into()
-                    .unwrap();
-                let entry;
-                {
-                    let mut tx = self.tx.lock().await;
-                    entry = tx.remove(&txid).ok_or("tx remove fail")?;
+            Type::Response { r } => {
+                let mut idx = 0;
+                for (w, (i, _)) in buf.windows(4).zip(buf.iter().enumerate()) {
+                    if w == b"2:ip" {
+                        idx = i + 4;
+                        break;
+                    }
                 }
-                let (addr, msg);
-                addr = entry.0;
-                msg = entry.1;
 
-                match msg {
-                    // handle ping response
-                    Msg::Ping => {
-                        match response.get("ip".as_bytes()) {
-                            Some(item) => {
-                                let ip =
-                                    u32::from_ne_bytes(item.get_str()[0..4].try_into().unwrap());
+                if idx > 0 {
+                    let ip = &buf[idx..idx + 6];
+                    let ip = u32::from_ne_bytes(ip[2..6].try_into().unwrap());
 
-                                let rand = rand::random::<u32>() & 0xff;
-                                let r = rand & 0x7;
-                                let crc = crc32c(&((ip & 0x030f3fff) | (r << 29)).to_ne_bytes());
+                    let rand = rand::random::<u32>() & 0xff;
+                    let r_bits = rand & 0x7;
+                    let crc = crc32c(&((ip & 0x030f3fff) | (r_bits << 29)).to_ne_bytes());
 
-                                let mut node_id = rand::random::<[u8; ID_BYTES]>();
-                                node_id[0] = ((crc >> 24) & 0xff) as u8;
-                                node_id[1] = ((crc >> 16) & 0xff) as u8;
-                                node_id[2] =
-                                    ((crc >> 8) & 0xf8) as u8 | (rand::random::<u8>() & 0x7);
-                                node_id[19] = rand as u8;
-                                let _ = self.id.set(NodeId(node_id));
-                            }
-                            None => {}
+                    let mut node_id = rand::random::<[u8; ID_BYTES]>();
+                    node_id[0] = ((crc >> 24) & 0xff) as u8;
+                    node_id[1] = ((crc >> 16) & 0xff) as u8;
+                    node_id[2] = ((crc >> 8) & 0xf8) as u8 | (rand::random::<u8>() & 0x7);
+                    node_id[19] = rand as u8;
+                    let _ = self.id.set(NodeId(node_id));
+                }
+
+                match r {
+                    Returns::GetPeers {
+                        id,
+                        token,
+                        values_nodes,
+                    } => {}
+                    Returns::FindNode { nodes, .. } => {
+                        let contacts: Vec<Vec<u8>> = nodes.chunks(26).map(|x| x.to_vec()).collect();
+
+                        for contact in contacts {
+                            let node = Node::from_be_bytes(contact);
+                            let krpc_ = Arc::clone(&self);
+
+                            let _ = krpc_.ping(node.ip_port).await;
                         }
-
-                        let id = r.get("id".as_bytes()).unwrap().get_str();
+                    }
+                    Returns::Ping { id } => {
                         let node = Node {
-                            id: NodeId(
-                                id.try_into()
-                                    .map_err(|e| format!("NodeId try_into fail {:?}", e))?,
-                            ),
+                            id: NodeId(Self::get_node_id(id)?),
                             ip_port: (addr.ip(), addr.port()),
                         };
 
@@ -151,38 +144,16 @@ impl KRPC {
                             dht.insert_node(node);
                         }
                     }
-                    Msg::FindNode => match r.get("target".as_bytes()) {
-                        Some(item) => {
-                            let contact = item.get_str();
-                            let node = Node::from_be_bytes(contact);
-
-                            let krpc_ = Arc::clone(&self);
-
-                            let _ = krpc_.ping(node.ip_port).await;
-                        }
-                        None => match r.get("nodes".as_bytes()) {
-                            Some(item) => {
-                                let contacts: Vec<Vec<u8>> =
-                                    item.get_str().chunks(26).map(|x| x.to_vec()).collect();
-
-                                for contact in contacts {
-                                    let node = Node::from_be_bytes(contact);
-                                    let krpc_ = Arc::clone(&self);
-
-                                    let _ = krpc_.ping(node.ip_port).await;
-                                }
-                            }
-                            None => return Err("no target or nodes key".to_string()),
-                        },
-                    },
-                    Msg::GetPeers => todo!(),
-                    Msg::AnnouncePeer => todo!(),
+                    Returns::AnnouncePeer { .. } => unreachable!(),
                 }
             }
-            // handle errors
-            b"e" => {}
-
-            _ => unreachable!(),
+            Type::Error { e } => {
+                return Err(format!(
+                    "{:?} {}",
+                    e.0,
+                    std::str::from_utf8(e.1).map_err(|e| format!("from_utf8 {}", e))?
+                ))
+            }
         }
 
         Ok(())
@@ -203,23 +174,27 @@ impl KRPC {
                 false => continue,
                 true => {
                     let mut tx = self.tx.lock().await;
-                    tx.insert(txid, (addr, Msg::Ping));
+                    tx.insert(txid, addr);
                     break;
                 }
             }
         }
 
-        let mut map: BTreeMap<Vec<u8>, Item> = BTreeMap::new();
-        map.insert(b"t".to_vec(), Item::String(txid.to_vec()));
-        map.insert(b"y".to_vec(), Item::String(b"q".to_vec()));
-        map.insert(b"q".to_vec(), Item::String(b"ping".to_vec()));
+        let msg = Message {
+            t: &txid,
+            mtype: Type::Query {
+                a: Arguments::Ping {
+                    id: match self.id.initialized() {
+                        true => &self.id.get().unwrap().0,
+                        false => &[0u8; 20],
+                    },
+                },
+                q: b"ping",
+            },
+            y: b"q",
+        };
 
-        let mut args: BTreeMap<Vec<u8>, Item> = BTreeMap::new();
-        let id = [0u8; 20];
-        args.insert(b"id".to_vec(), Item::String(id.to_vec()));
-        map.insert(b"a".to_vec(), Item::Dict(args));
-
-        let bytes = encode(vec![Item::Dict(map)]);
+        let bytes = encode::to_bytes(&msg).unwrap();
         self.socket.send_to(&bytes, ip_port).await?;
 
         Ok(())
@@ -240,29 +215,30 @@ impl KRPC {
                 false => continue,
                 true => {
                     let mut tx = self.tx.lock().await;
-                    tx.insert(txid, (addr, Msg::FindNode));
+                    tx.insert(txid, addr);
                     break;
                 }
             }
         }
-
-        let mut map: BTreeMap<Vec<u8>, Item> = BTreeMap::new();
-        map.insert(b"t".to_vec(), Item::String(txid.to_vec()));
-        map.insert(b"y".to_vec(), Item::String(b"q".to_vec()));
-        map.insert(b"q".to_vec(), Item::String(b"find_node".to_vec()));
-
-        let mut args: BTreeMap<Vec<u8>, Item> = BTreeMap::new();
-        args.insert(
-            b"id".to_vec(),
-            Item::String(self.id.get().unwrap().0.to_vec()),
-        );
         let mut target = id.0.to_vec();
         target.reverse();
-        args.insert(b"target".to_vec(), Item::String(target));
-        map.insert(b"a".to_vec(), Item::Dict(args));
 
-        let bytes = encode(vec![Item::Dict(map)]);
+        let msg = Message {
+            t: &txid,
+            mtype: Type::Query {
+                a: Arguments::FindNode {
+                    id: match self.id.initialized() {
+                        true => &self.id.get().unwrap().0,
+                        false => &[0u8; 20],
+                    },
+                    target: &target,
+                },
+                q: b"find_node",
+            },
+            y: b"q",
+        };
 
+        let bytes = encode::to_bytes(&msg).unwrap();
         self.socket.send_to(&bytes, ip_port).await?;
 
         Ok(())
